@@ -129,11 +129,18 @@ impl Console {
     }
 
     /// Send one S-record line at a time with the legacy 10 ms pacing.
-    pub fn send_srec(&mut self, path: &Path) -> Result<()> {
-        let mut reader = BufReader::new(File::open(path).with_context(|| {
-            format!("opening S-record {}", path.display())
-        })?);
+    ///
+    /// Prints an in-place progress line (percent, bytes, records) while sending.
+    pub fn send_srec(&mut self, path: &Path, label: &str) -> Result<()> {
+        let file = File::open(path)
+            .with_context(|| format!("opening S-record {}", path.display()))?;
+        let total_bytes = file.metadata()?.len().max(1);
+        let mut reader = BufReader::new(file);
         let mut line = Vec::with_capacity(1024);
+        let mut sent_bytes: u64 = 0;
+        let mut records: u64 = 0;
+        let mut last_percent: u8 = 255;
+        let started = Instant::now();
 
         loop {
             line.clear();
@@ -145,20 +152,69 @@ impl Console {
             if count == 0 {
                 break;
             }
+
+            sent_bytes = sent_bytes.saturating_add(count as u64);
+
             if line.len() > 1024 {
+                eprint!("\n");
                 bail!("S-record line exceeds 1024 bytes in {}", path.display());
             }
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
             if !line.starts_with(b"S") {
+                eprint!("\n");
                 bail!("invalid S-record line in {}", path.display());
             }
 
             self.send(&line)?;
+            records += 1;
             std::thread::sleep(Duration::from_millis(10));
+
+            let percent = ((sent_bytes.saturating_mul(100)) / total_bytes).min(100) as u8;
+            // Refresh when the percent ticks, every 25 records, or on the first record.
+            if percent != last_percent || records == 1 || records % 25 == 0 {
+                last_percent = percent;
+                render_progress(label, percent, sent_bytes, total_bytes, records, started);
+            }
         }
 
+        render_progress(label, 100, total_bytes, total_bytes, records, started);
+        eprintln!();
         Ok(())
+    }
+}
+
+fn render_progress(
+    label: &str,
+    percent: u8,
+    sent_bytes: u64,
+    total_bytes: u64,
+    records: u64,
+    started: Instant,
+) {
+    const WIDTH: usize = 28;
+    let filled = (usize::from(percent) * WIDTH) / 100;
+    let bar: String = std::iter::repeat_n('=', filled)
+        .chain(std::iter::repeat_n(' ', WIDTH.saturating_sub(filled)))
+        .collect();
+    let elapsed = started.elapsed().as_secs_f32().max(0.001);
+    let rate_kib = (sent_bytes as f32 / 1024.0) / elapsed;
+
+    eprint!(
+        "\r{label}: [{bar}] {percent:>3}%  {}/{}  {records} rec  {rate_kib:>5.1} KiB/s",
+        format_bytes(sent_bytes),
+        format_bytes(total_bytes),
+    );
+    let _ = std::io::stderr().flush();
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }

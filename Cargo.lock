@@ -145,7 +145,6 @@ dependencies = [
  "anyhow",
  "clap",
  "serialport",
- "thiserror",
 ]
 
 [[package]]

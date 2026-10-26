@@ -30,7 +30,7 @@ pub fn wait_for_download_prompt(console: &mut Console, timeout_secs: u64) -> Res
 pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
     let flashwriter = image_file(package, FLASHWRITER)?;
     println!("Sending FlashWriter ({FLASHWRITER})…");
-    console.send_srec(&flashwriter)?;
+    console.send_srec(&flashwriter, "FlashWriter")?;
     console
         .wait(b">", seconds(30))
         .context("timed out waiting for FlashWriter prompt")?;
@@ -80,7 +80,7 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
     console.wait(b"please send ! (Motorola S-record)", seconds(15))?;
     std::thread::sleep(Duration::from_millis(400));
 
-    console.send_srec(&file)?;
+    console.send_srec(&file, image.name)?;
 
     if image.emmc {
         console
