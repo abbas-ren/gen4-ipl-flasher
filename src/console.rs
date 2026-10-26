@@ -113,11 +113,14 @@ impl Console {
     }
 
     pub fn wait(&mut self, expected: &[u8], timeout: Duration) -> Result<()> {
-        self.wait_any(&[expected], timeout).map(|_| ())
+        self.wait_any(&[expected], timeout, false).map(|_| ())
     }
 
     /// Consume through the earliest matching prompt; return its index.
-    pub fn wait_any(&mut self, patterns: &[&[u8]], timeout: Duration) -> Result<usize> {
+    ///
+    /// When `echo` is true, newly received UART bytes are printed live so a
+    /// wrong baud rate (garbage) is obvious while waiting.
+    pub fn wait_any(&mut self, patterns: &[&[u8]], timeout: Duration, echo: bool) -> Result<usize> {
         if patterns.is_empty()
             || patterns
                 .iter()
@@ -148,11 +151,17 @@ impl Console {
                 .min_by_key(|(position, index, _)| (*position, *index));
 
             if let Some((position, index, length)) = matched {
+                if echo {
+                    eprintln!();
+                }
                 self.pending.drain(..position + length);
                 return Ok(index);
             }
 
             if Instant::now() >= deadline {
+                if echo {
+                    eprintln!();
+                }
                 let preview = self.pending_preview();
                 bail!(
                     "UART prompt timeout; expected one of {:?}. Recent UART output: {:?}",
@@ -171,7 +180,13 @@ impl Console {
 
             match self.port.read(&mut input) {
                 Ok(0) => std::thread::sleep(Duration::from_millis(5)),
-                Ok(count) => self.pending.extend_from_slice(&input[..count]),
+                Ok(count) => {
+                    if echo {
+                        eprint!("{}", String::from_utf8_lossy(&input[..count]));
+                        let _ = std::io::stderr().flush();
+                    }
+                    self.pending.extend_from_slice(&input[..count]);
+                }
                 Err(error)
                     if matches!(
                         error.kind(),

@@ -14,19 +14,25 @@ fn seconds(value: u64) -> Duration {
     Duration::from_secs(value)
 }
 
-/// Wait for SCIF download prompt.
-///
-/// Caller must already have confirmed the board is in download mode; this
-/// function only starts listening after that confirmation.
+/// Wait for a fresh SCIF download prompt after the operator resets the board.
 pub fn wait_for_download_prompt(console: &mut Console, timeout_secs: u64) -> Result<()> {
-    println!("Listening for SCIF download prompt (please send !)…");
+    println!();
+    println!("==========================================================================");
+    println!("UART is OPEN and listening.");
+    println!("NOW reboot / put the board into SCIF download mode with the switches.");
+    println!("(Same order as edgecontroller: listen first, then enter download mode.)");
+    println!("Waiting for SCIF prompt: please send !");
+    println!("Live UART follows (garbage usually means wrong --baud):");
+    println!("==========================================================================");
+
     console
         .wait_any(
             &[b"please send !", b"please send", b"send !"],
             seconds(timeout_secs),
+            true,
         )
         .context("timed out waiting for download-mode prompt")?;
-    println!("SCIF download prompt received.");
+    println!("SCIF download prompt received — starting FlashWriter upload.");
     Ok(())
 }
 
@@ -37,24 +43,52 @@ pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
     console.send_srec(&flashwriter, "FlashWriter")?;
 
     println!("FlashWriter .mot transfer finished.");
-    println!(
-        "Next: waiting for the FlashWriter console prompt ('>')."
-    );
-    println!(
-        "Do nothing with the switches — the board should start FlashWriter by itself."
-    );
+    println!("Next: waiting for FlashWriter console prompt ('>').");
+    println!("Do nothing with switches — FlashWriter should start by itself.");
+    println!("Live UART follows:");
     // Give SCIF a moment to jump into FlashWriter after the last S-record.
     std::thread::sleep(Duration::from_millis(500));
 
-    console
-        .wait(b">", seconds(60))
+    let outcome = console
+        .wait_any(
+            &[
+                b">",
+                b"Failed to DRAM initialize",
+                b"InitDram error",
+                b"Failed to DRAM",
+            ],
+            seconds(60),
+            true,
+        )
         .with_context(|| {
             format!(
-                "timed out waiting for FlashWriter prompt ('>'). \
+                "timed out waiting for FlashWriter prompt ('>').\n\
+                 Common causes:\n\
+                 - wrong baud (try --baud 115200; Gen4 farm default is 921600)\n\
+                 - download mode was entered BEFORE the flasher opened UART \
+                   (reset into download mode only AFTER 'UART is OPEN')\n\
+                 - corrupt/incomplete .mot transfer (USB-UART unreliable at high baud)\n\
                  Recent UART output: {:?}",
                 console.pending_preview()
             )
         })?;
+
+    if outcome != 0 {
+        anyhow::bail!(
+            "FlashWriter started but DRAM init failed (board printed a DRAM error).\n\
+             This is not a UART timing bug in the flasher — FlashWriter's built-in \
+             LPDDR config does not match this board / power / image.\n\
+             Check:\n\
+             - Use the exact Gen4 package that works on the farm \
+               (ICUMX_Flash_writer_SCIF_DUMMY_CERT_EB203000_V4H.mot for White Hawk)\n\
+             - DRAM rails are up before SCIF download mode\n\
+             - Board is the matching V4H/White Hawk hardware (wrong SoC/DRAM density \
+               needs a rebuilt FlashWriter)\n\
+             Recent UART: {:?}",
+            console.pending_preview()
+        );
+    }
+
     println!("FlashWriter ready (received '>').");
     Ok(())
 }
@@ -109,7 +143,7 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
             .with_context(|| format!("waiting for eMMC complete for {}", image.name))?;
     } else {
         let response = console
-            .wait_any(&[b"complete!", b"Clear OK?(y/n)"], seconds(60))
+            .wait_any(&[b"complete!", b"Clear OK?(y/n)"], seconds(60), false)
             .with_context(|| format!("waiting for program complete for {}", image.name))?;
 
         if response == 1 {
@@ -121,11 +155,8 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
     Ok(())
 }
 
-/// One download-mode session: load FlashWriter, then program a single image.
-///
-/// Must only be called after the operator has confirmed the board is already
-/// in SCIF download mode for this image. The serial port is opened here, not
-/// before that confirmation.
+/// One download-mode session: open UART, wait for a fresh SCIF prompt after
+/// the operator resets, load FlashWriter, then program a single image.
 pub fn flash_one_image(
     tty: &str,
     baud: u32,
@@ -133,13 +164,12 @@ pub fn flash_one_image(
     image: &Image,
     download_timeout_secs: u64,
 ) -> Result<()> {
-    println!("Opening {tty} at {baud} baud…");
+    println!("Opening {tty} at {baud} baud (listen BEFORE download-mode reset)…");
     let mut console = Console::open(tty, baud)?;
     console.clear_input()?;
     wait_for_download_prompt(&mut console, download_timeout_secs)?;
     load_flashwriter(&mut console, package)?;
     transfer_image(&mut console, package, image)?;
-    // Release UART before the operator reboots for the next image.
     drop(console);
     println!("Serial port closed. Safe to reboot for the next file when asked.");
     Ok(())

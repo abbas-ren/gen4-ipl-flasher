@@ -3,9 +3,10 @@
 //! Uses the same FlashWriter UART protocol as edgecontroller, but leaves
 //! download-mode entry and board reboots to the operator (physical switches).
 //!
-//! Important: after each image, the tool blocks on operator confirmation and
-//! does not open the UART or wait for any device prompts until you confirm
-//! the board has been rebooted into download mode for the next file.
+//! Critical timing (same as edgecontroller): the flasher opens the UART and
+//! starts listening FIRST, then you reset into SCIF download mode so the
+//! fresh "please send !" prompt is captured. Entering download mode before
+//! the port is open often yields a successful-looking .mot send with no '>'.
 
 mod console;
 mod flash;
@@ -23,11 +24,10 @@ use std::{
 #[command(
     name = "gen4-ipl-flasher",
     about = "Flash Gen4 IPL images over UART with manual download mode / reboot",
-    long_about = "FlashWriter and payload S-records are taken from an images folder \
-(same layout as edgecontroller Gen4 packages). Put the board into SCIF download \
-mode with switches before each image. After each successful program, reboot into \
-download mode again when prompted. The flasher will not listen for UART prompts \
-until you confirm that reboot."
+    long_about = "FlashWriter and payload S-records come from an images folder \
+(same layout as edgecontroller Gen4 packages). For each file the flasher opens \
+UART first; you then reboot into SCIF download mode with switches. After each \
+image, confirm before the next listen/reset cycle."
 )]
 struct Cli {
     /// Serial device, e.g. /dev/ttyUSB0
@@ -38,11 +38,11 @@ struct Cli {
     #[arg(short, long, value_name = "DIR")]
     images: PathBuf,
 
-    /// UART baud rate (FlashWriter SCIF default)
+    /// UART baud rate (edgecontroller Gen4 uses 921600; try 115200 if UART looks like garbage)
     #[arg(long, default_value_t = 921_600)]
     baud: u32,
 
-    /// Seconds to wait for the SCIF "please send !" prompt after confirmation
+    /// Seconds to wait for the SCIF "please send !" prompt after UART opens
     #[arg(long, default_value_t = 120)]
     download_timeout: u64,
 
@@ -51,23 +51,23 @@ struct Cli {
     start_from: usize,
 }
 
-/// Block until the operator confirms. No UART I/O happens before this returns.
-fn confirm_download_mode_ready(image_name: &str, step: usize, total: usize, is_first: bool) -> Result<()> {
+/// Confirm the operator is ready. Download-mode reset happens AFTER UART opens.
+fn confirm_ready_to_listen(image_name: &str, step: usize, total: usize, is_first: bool) -> Result<()> {
     println!();
     println!("--------------------------------------------------------------------------");
     if is_first {
         println!("READY FOR FILE [{step}/{total}]: {image_name}");
-        println!("1. Put the board into SCIF download mode using the switches.");
-        println!("2. Press Enter ONLY after download mode is active.");
     } else {
         println!("NEXT FILE [{step}/{total}]: {image_name}");
-        println!("1. Reboot the board into SCIF download mode using the switches.");
-        println!("2. Press Enter ONLY after that reboot/download-mode is complete.");
+        println!("Prepare to reboot into SCIF download mode again.");
     }
-    println!("The flasher will NOT open the serial port or wait for device prompts");
-    println!("until you press Enter here.");
+    println!();
+    println!("IMPORTANT — do NOT enter download mode yet.");
+    println!("1. Press Enter here first (flasher will open UART and listen).");
+    println!("2. When it says \"UART is OPEN\", THEN reset into download mode.");
+    println!("   That is how edgecontroller catches a fresh \"please send !\".");
     println!("--------------------------------------------------------------------------");
-    print!("Press Enter when the device is ready in download mode… ");
+    print!("Press Enter to open UART and start listening… ");
     io::stdout().flush()?;
 
     let mut line = String::new();
@@ -75,7 +75,7 @@ fn confirm_download_mode_ready(image_name: &str, step: usize, total: usize, is_f
         .read_line(&mut line)
         .context("reading operator confirmation")?;
 
-    println!("Confirmed. Starting flash session for {image_name}…");
+    println!("Opening session for {image_name}…");
     Ok(())
 }
 
@@ -102,8 +102,7 @@ fn main() -> Result<()> {
     }
     println!();
     println!("TTY={}  baud={}", cli.tty, cli.baud);
-    println!("Download mode and power/reboot are manual (switches).");
-    println!("UART waits start only after each of your confirmations.\n");
+    println!("Listen first, then reset into download mode (matches edgecontroller).\n");
 
     let total = IMAGES.len();
     let images: Vec<_> = IMAGES.iter().enumerate().skip(cli.start_from).collect();
@@ -112,8 +111,7 @@ fn main() -> Result<()> {
         let step = index + 1;
         let is_first = position == 0;
 
-        // Gate: no UART activity for this file until the operator confirms.
-        confirm_download_mode_ready(image.name, step, total, is_first)?;
+        confirm_ready_to_listen(image.name, step, total, is_first)?;
 
         println!("========== [{step}/{total}] {} ==========", image.name);
         flash::flash_one_image(
@@ -133,9 +131,6 @@ fn main() -> Result<()> {
             println!(
                 "Finished {current}. Next up is {next}.",
                 current = image.name
-            );
-            println!(
-                "Do not continue until you have rebooted the device into download mode for {next}."
             );
         }
     }
