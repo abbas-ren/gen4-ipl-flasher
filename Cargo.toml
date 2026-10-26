@@ -1,0 +1,11 @@
+[package]
+name = "gen4-ipl-flasher"
+version = "0.1.0"
+edition = "2021"
+description = "Manual Gen4 IPL flasher: FlashWriter UART protocol with operator-controlled download mode and reboots"
+authors = ["abbas-ren"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serialport = "4.7"
