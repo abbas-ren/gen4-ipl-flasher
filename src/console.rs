@@ -41,6 +41,60 @@ impl Console {
         Ok(())
     }
 
+    /// Pull any queued RX bytes into `pending` without blocking long.
+    ///
+    /// Must run during large S-record uploads: otherwise the kernel tty
+    /// buffer can overrun and the FlashWriter `>` prompt is lost.
+    fn drain_rx(&mut self) -> Result<()> {
+        let available = self.port.bytes_to_read().unwrap_or(0);
+        if available == 0 {
+            return Ok(());
+        }
+
+        let mut buf = vec![0_u8; available.min(4096) as usize];
+        match self.port.read(&mut buf) {
+            Ok(0) => Ok(()),
+            Ok(count) => {
+                self.pending.extend_from_slice(&buf[..count]);
+                if self.pending.len() > 16_384 {
+                    let discard = self.pending.len() - 4096;
+                    self.pending.drain(..discard);
+                }
+                Ok(())
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Recent UART text for timeout diagnostics.
+    pub fn pending_preview(&self) -> String {
+        let tail = if self.pending.len() > 400 {
+            &self.pending[self.pending.len() - 400..]
+        } else {
+            &self.pending[..]
+        };
+        String::from_utf8_lossy(tail)
+            .chars()
+            .map(|ch| {
+                if ch == '\r' || ch == '\n' || ch.is_ascii_graphic() || ch == ' ' {
+                    ch
+                } else {
+                    '·'
+                }
+            })
+            .collect()
+    }
+
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         self.port
             .write_all(bytes)
@@ -99,12 +153,14 @@ impl Console {
             }
 
             if Instant::now() >= deadline {
+                let preview = self.pending_preview();
                 bail!(
-                    "UART prompt timeout; expected one of {:?}",
+                    "UART prompt timeout; expected one of {:?}. Recent UART output: {:?}",
                     patterns
                         .iter()
                         .map(|pattern| String::from_utf8_lossy(pattern))
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>(),
+                    preview
                 );
             }
 
@@ -168,6 +224,8 @@ impl Console {
             }
 
             self.send(&line)?;
+            // Drain RX so device output (including a later '>' prompt) is not dropped.
+            self.drain_rx()?;
             records += 1;
             std::thread::sleep(Duration::from_millis(10));
 
@@ -179,6 +237,7 @@ impl Console {
             }
         }
 
+        self.drain_rx()?;
         render_progress(label, 100, total_bytes, total_bytes, records, started);
         eprintln!();
         Ok(())

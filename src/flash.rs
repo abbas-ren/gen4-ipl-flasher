@@ -35,10 +35,27 @@ pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
     let flashwriter = image_file(package, FLASHWRITER)?;
     println!("Sending FlashWriter ({FLASHWRITER})…");
     console.send_srec(&flashwriter, "FlashWriter")?;
+
+    println!("FlashWriter .mot transfer finished.");
+    println!(
+        "Next: waiting for the FlashWriter console prompt ('>')."
+    );
+    println!(
+        "Do nothing with the switches — the board should start FlashWriter by itself."
+    );
+    // Give SCIF a moment to jump into FlashWriter after the last S-record.
+    std::thread::sleep(Duration::from_millis(500));
+
     console
-        .wait(b">", seconds(30))
-        .context("timed out waiting for FlashWriter prompt")?;
-    println!("FlashWriter ready.");
+        .wait(b">", seconds(60))
+        .with_context(|| {
+            format!(
+                "timed out waiting for FlashWriter prompt ('>'). \
+                 Recent UART output: {:?}",
+                console.pending_preview()
+            )
+        })?;
+    println!("FlashWriter ready (received '>').");
     Ok(())
 }
 
