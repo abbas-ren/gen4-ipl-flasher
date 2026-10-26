@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serialport::SerialPort;
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     time::{Duration, Instant},
@@ -20,9 +20,21 @@ pub fn open_uart(path: &str, baud: u32) -> Result<Box<dyn SerialPort>> {
         .with_context(|| format!("opening UART {path} at {baud} baud"))
 }
 
+/// Append-only device RX log (host markers + UART bytes from the board).
+pub fn open_rx_log(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening UART RX log {}", path.display()))
+}
+
 pub struct Console {
     port: Box<dyn SerialPort>,
     pending: Vec<u8>,
+    rx_log: Option<File>,
+    /// When true, device RX bytes are appended to `rx_log`.
+    rx_log_enabled: bool,
 }
 
 impl Console {
@@ -30,7 +42,36 @@ impl Console {
         Ok(Self {
             port: open_uart(path, baud)?,
             pending: Vec::with_capacity(4096),
+            rx_log: None,
+            rx_log_enabled: false,
         })
+    }
+
+    pub fn attach_rx_log(&mut self, file: File) {
+        self.rx_log = Some(file);
+    }
+
+    pub fn set_rx_logging(&mut self, enabled: bool) {
+        self.rx_log_enabled = enabled;
+    }
+
+    pub fn log_marker(&mut self, message: &str) -> Result<()> {
+        if let Some(log) = self.rx_log.as_mut() {
+            writeln!(log, "\n===== {message} =====")?;
+            log.flush()?;
+        }
+        Ok(())
+    }
+
+    fn log_rx(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.rx_log_enabled || bytes.is_empty() {
+            return Ok(());
+        }
+        if let Some(log) = self.rx_log.as_mut() {
+            log.write_all(bytes)?;
+            log.flush()?;
+        }
+        Ok(())
     }
 
     pub fn clear_input(&mut self) -> Result<()> {
@@ -55,6 +96,7 @@ impl Console {
         match self.port.read(&mut buf) {
             Ok(0) => Ok(()),
             Ok(count) => {
+                self.log_rx(&buf[..count])?;
                 self.pending.extend_from_slice(&buf[..count]);
                 if self.pending.len() > 16_384 {
                     let discard = self.pending.len() - 4096;
@@ -181,6 +223,7 @@ impl Console {
             match self.port.read(&mut input) {
                 Ok(0) => std::thread::sleep(Duration::from_millis(5)),
                 Ok(count) => {
+                    self.log_rx(&input[..count])?;
                     if echo {
                         eprint!("{}", String::from_utf8_lossy(&input[..count]));
                         let _ = std::io::stderr().flush();
@@ -199,9 +242,35 @@ impl Console {
         }
     }
 
+    /// Collect trailing device RX for a short window (post-flash capture).
+    pub fn collect_rx_for(&mut self, duration: Duration) -> Result<()> {
+        let deadline = Instant::now() + duration;
+        let mut input = [0_u8; 1024];
+        while Instant::now() < deadline {
+            match self.port.read(&mut input) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(count) => {
+                    self.log_rx(&input[..count])?;
+                    self.pending.extend_from_slice(&input[..count]);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Send one S-record line at a time with the legacy 10 ms pacing.
     ///
     /// Prints an in-place progress line (percent, bytes, records) while sending.
+    /// Device RX is still drained (for prompt integrity) but not written to the
+    /// RX log during the bulk upload.
     pub fn send_srec(&mut self, path: &Path, label: &str) -> Result<()> {
         let file = File::open(path)
             .with_context(|| format!("opening S-record {}", path.display()))?;
@@ -212,50 +281,61 @@ impl Console {
         let mut records: u64 = 0;
         let mut last_percent: u8 = 255;
         let started = Instant::now();
+        let logging = self.rx_log_enabled;
+        self.rx_log_enabled = false;
 
-        loop {
-            line.clear();
-            let count = {
-                let mut bounded = (&mut reader).take(1025);
-                bounded.read_until(b'\n', &mut line)?
-            };
+        let result = (|| {
+            loop {
+                line.clear();
+                let count = {
+                    let mut bounded = (&mut reader).take(1025);
+                    bounded.read_until(b'\n', &mut line)?
+                };
 
-            if count == 0 {
-                break;
+                if count == 0 {
+                    break;
+                }
+
+                sent_bytes = sent_bytes.saturating_add(count as u64);
+
+                if line.len() > 1024 {
+                    eprint!("\n");
+                    bail!("S-record line exceeds 1024 bytes in {}", path.display());
+                }
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                if !line.starts_with(b"S") {
+                    eprint!("\n");
+                    bail!("invalid S-record line in {}", path.display());
+                }
+
+                self.send(&line)?;
+                self.drain_rx()?;
+                records += 1;
+                std::thread::sleep(Duration::from_millis(10));
+
+                let percent = ((sent_bytes.saturating_mul(100)) / total_bytes).min(100) as u8;
+                if percent != last_percent || records == 1 || records % 25 == 0 {
+                    last_percent = percent;
+                    render_progress(label, percent, sent_bytes, total_bytes, records, started);
+                }
             }
 
-            sent_bytes = sent_bytes.saturating_add(count as u64);
-
-            if line.len() > 1024 {
-                eprint!("\n");
-                bail!("S-record line exceeds 1024 bytes in {}", path.display());
-            }
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            if !line.starts_with(b"S") {
-                eprint!("\n");
-                bail!("invalid S-record line in {}", path.display());
-            }
-
-            self.send(&line)?;
-            // Drain RX so device output (including a later '>' prompt) is not dropped.
             self.drain_rx()?;
-            records += 1;
-            std::thread::sleep(Duration::from_millis(10));
+            render_progress(label, 100, total_bytes, total_bytes, records, started);
+            eprintln!();
+            Ok(())
+        })();
 
-            let percent = ((sent_bytes.saturating_mul(100)) / total_bytes).min(100) as u8;
-            // Refresh when the percent ticks, every 25 records, or on the first record.
-            if percent != last_percent || records == 1 || records % 25 == 0 {
-                last_percent = percent;
-                render_progress(label, percent, sent_bytes, total_bytes, records, started);
-            }
+        self.rx_log_enabled = logging;
+        // Bytes drained during the upload sit in `pending` but were not logged;
+        // flush them now so post-flash device text (e.g. DRAM errors) is captured.
+        if result.is_ok() && logging && !self.pending.is_empty() {
+            let pending = self.pending.clone();
+            let _ = self.log_rx(&pending);
         }
-
-        self.drain_rx()?;
-        render_progress(label, 100, total_bytes, total_bytes, records, started);
-        eprintln!();
-        Ok(())
+        result
     }
 }
 

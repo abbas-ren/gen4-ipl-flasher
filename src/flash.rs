@@ -1,7 +1,7 @@
 //! FlashWriter programming steps (from edgecontroller ipl::transfer_image).
 
 use crate::{
-    console::Console,
+    console::{open_rx_log, Console},
     images::{image_file, Image, FLASHWRITER},
 };
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ pub fn wait_for_download_prompt(console: &mut Console, timeout_secs: u64) -> Res
     println!("(Same order as edgecontroller: listen first, then enter download mode.)");
     println!("Waiting for SCIF prompt: please send !");
     println!("Live UART follows (garbage usually means wrong --baud):");
+    println!("Device RX is being written to the UART log.");
     println!("==========================================================================");
 
     console
@@ -39,9 +40,11 @@ pub fn wait_for_download_prompt(console: &mut Console, timeout_secs: u64) -> Res
 /// Load FlashWriter into RAM over SCIF, then wait for its `>` prompt.
 pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
     let flashwriter = image_file(package, FLASHWRITER)?;
+    console.log_marker("FlashWriter .mot send starting (RX log paused during upload)")?;
     println!("Sending FlashWriter ({FLASHWRITER})…");
     console.send_srec(&flashwriter, "FlashWriter")?;
 
+    console.log_marker("FlashWriter .mot send finished — logging device RX again")?;
     println!("FlashWriter .mot transfer finished.");
     println!("Next: waiting for FlashWriter console prompt ('>').");
     println!("Do nothing with switches — FlashWriter should start by itself.");
@@ -96,6 +99,7 @@ pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
 /// Program one image through an already-running FlashWriter session.
 pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> Result<()> {
     let file = image_file(package, image.name)?;
+    console.log_marker(&format!("Programming payload {}", image.name))?;
     println!(
         "Programming {} (save={}, address={}, emmc={})",
         image.name, image.save, image.address, image.emmc
@@ -135,7 +139,15 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
     console.wait(b"please send ! (Motorola S-record)", seconds(15))?;
     std::thread::sleep(Duration::from_millis(400));
 
+    console.log_marker(&format!(
+        "Payload {} S-record send starting (RX log paused during upload)",
+        image.name
+    ))?;
     console.send_srec(&file, image.name)?;
+    console.log_marker(&format!(
+        "Payload {} S-record send finished — logging post-flash device RX",
+        image.name
+    ))?;
 
     if image.emmc {
         console
@@ -152,6 +164,9 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
         }
     }
 
+    // Capture any trailing board output after the file finishes.
+    console.log_marker(&format!("Trailing RX after {}", image.name))?;
+    console.collect_rx_for(Duration::from_secs(2))?;
     Ok(())
 }
 
@@ -163,13 +178,27 @@ pub fn flash_one_image(
     package: &Path,
     image: &Image,
     download_timeout_secs: u64,
+    uart_log: &Path,
 ) -> Result<()> {
     println!("Opening {tty} at {baud} baud (listen BEFORE download-mode reset)…");
+    println!("Device RX log: {}", uart_log.display());
+
     let mut console = Console::open(tty, baud)?;
+    console.attach_rx_log(open_rx_log(uart_log)?);
     console.clear_input()?;
+
+    // Log device text from the first please-send wait onward (and after each flash).
+    console.log_marker(&format!(
+        "Waiting for please send ! before flashing {}",
+        image.name
+    ))?;
+    console.set_rx_logging(true);
+
     wait_for_download_prompt(&mut console, download_timeout_secs)?;
     load_flashwriter(&mut console, package)?;
     transfer_image(&mut console, package, image)?;
+
+    console.log_marker(&format!("Session finished for {}", image.name))?;
     drop(console);
     println!("Serial port closed. Safe to reboot for the next file when asked.");
     Ok(())

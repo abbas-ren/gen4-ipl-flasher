@@ -49,6 +49,10 @@ struct Cli {
     /// 0-based index into the Gen4 image list to start from (resume)
     #[arg(long, default_value_t = 0)]
     start_from: usize,
+
+    /// Append device RX here (from first please-send wait; paused during S-record uploads)
+    #[arg(long, default_value = "gen4-ipl-uart.log", value_name = "FILE")]
+    uart_log: PathBuf,
 }
 
 /// Confirm the operator is ready. Download-mode reset happens AFTER UART opens.
@@ -102,6 +106,7 @@ fn main() -> Result<()> {
     }
     println!();
     println!("TTY={}  baud={}", cli.tty, cli.baud);
+    println!("UART RX log={}", cli.uart_log.display());
     println!("Listen first, then reset into download mode (matches edgecontroller).\n");
 
     let total = IMAGES.len();
@@ -120,6 +125,7 @@ fn main() -> Result<()> {
             &package,
             image,
             cli.download_timeout,
+            &cli.uart_log,
         )
         .with_context(|| format!("flashing {}", image.name))?;
 
