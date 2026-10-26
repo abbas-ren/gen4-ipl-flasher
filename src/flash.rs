@@ -14,15 +14,19 @@ fn seconds(value: u64) -> Duration {
     Duration::from_secs(value)
 }
 
-/// Wait for SCIF download prompt after the operator enables download mode.
+/// Wait for SCIF download prompt.
+///
+/// Caller must already have confirmed the board is in download mode; this
+/// function only starts listening after that confirmation.
 pub fn wait_for_download_prompt(console: &mut Console, timeout_secs: u64) -> Result<()> {
-    println!("Waiting for SCIF download prompt (please send !)…");
+    println!("Listening for SCIF download prompt (please send !)…");
     console
         .wait_any(
             &[b"please send !", b"please send", b"send !"],
             seconds(timeout_secs),
         )
         .context("timed out waiting for download-mode prompt")?;
+    println!("SCIF download prompt received.");
     Ok(())
 }
 
@@ -101,6 +105,10 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
 }
 
 /// One download-mode session: load FlashWriter, then program a single image.
+///
+/// Must only be called after the operator has confirmed the board is already
+/// in SCIF download mode for this image. The serial port is opened here, not
+/// before that confirmation.
 pub fn flash_one_image(
     tty: &str,
     baud: u32,
@@ -108,12 +116,14 @@ pub fn flash_one_image(
     image: &Image,
     download_timeout_secs: u64,
 ) -> Result<()> {
+    println!("Opening {tty} at {baud} baud…");
     let mut console = Console::open(tty, baud)?;
     console.clear_input()?;
     wait_for_download_prompt(&mut console, download_timeout_secs)?;
     load_flashwriter(&mut console, package)?;
     transfer_image(&mut console, package, image)?;
-    // Drop UART before the operator reboots for the next image.
+    // Release UART before the operator reboots for the next image.
     drop(console);
+    println!("Serial port closed. Safe to reboot for the next file when asked.");
     Ok(())
 }
