@@ -14,8 +14,9 @@ mod console;
 mod flash;
 mod images;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
+use console::SrecTransferOptions;
 use images::{package_dir, preflight};
 use std::{
     io::{self, Write},
@@ -58,11 +59,24 @@ struct Cli {
     /// Use only if the board's FlashWriter returns to its command prompt after
     /// each image is programmed.
     #[arg(long, default_value_t = false)]
-    all: bool,
+    all_in_one_go: bool,
 
     /// Append device RX here (from first please-send wait; paused during S-record uploads)
     #[arg(long, default_value = "gen4-ipl-uart.log", value_name = "FILE")]
     uart_log: PathBuf,
+
+    /// Target batch size for UART writes; complete S-records are never split across batches.
+    #[arg(long, default_value_t = 4096, value_name = "BYTES")]
+    batch_size_bytes: usize,
+
+    /// Optional delay after each UART batch (milliseconds). Default 0 maximizes throughput.
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    batch_delay_ms: u64,
+
+    /// Maximum accepted S-record line length, including its newline (host-side limit only).
+    /// Increase only if the target FlashWriter supports longer S-records.
+    #[arg(long, default_value_t = 1024, value_name = "BYTES")]
+    max_srec_line_bytes: usize,
 }
 
 /// Confirm the operator is ready. Download-mode reset happens AFTER UART opens.
@@ -100,6 +114,18 @@ fn confirm_ready_to_listen(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.batch_size_bytes == 0 {
+        bail!("--batch-size-bytes must be greater than zero");
+    }
+    if cli.max_srec_line_bytes < 16 {
+        bail!("--max-srec-line-bytes must be at least 16");
+    }
+    let transfer_options = SrecTransferOptions {
+        batch_size_bytes: cli.batch_size_bytes,
+        batch_delay: std::time::Duration::from_millis(cli.batch_delay_ms),
+        max_line_bytes: cli.max_srec_line_bytes,
+    };
 
     let package = package_dir(&cli.images)?;
     println!("Preflight check under {}…", package.display());
@@ -140,13 +166,11 @@ fn main() -> Result<()> {
         .skip(cli.start_from)
         .collect();
 
-    if cli.all {
+    if cli.all_in_one_go {
         let selected_images: Vec<_> = images.iter().map(|(_, image)| (**image).clone()).collect();
         println!("ALL-IN-ONE-GO mode: one UART session and one download-mode reset.");
         println!("FlashWriter will be loaded once; each selected payload will then be programmed.");
-        println!(
-            "Verify the board's FlashWriter supports programming multiple images in one session."
-        );
+        println!("Verify the board's FlashWriter supports programming multiple images in one session.");
 
         if let Some((index, image)) = images.first() {
             confirm_ready_to_listen(&image.name, index + 1, total, true)?;
@@ -160,6 +184,7 @@ fn main() -> Result<()> {
             &selected_images,
             cli.download_timeout,
             &cli.uart_log,
+            transfer_options,
         )
         .context("flashing all selected images in one UART session")?;
     } else {
@@ -178,6 +203,7 @@ fn main() -> Result<()> {
                 image,
                 cli.download_timeout,
                 &cli.uart_log,
+                transfer_options,
             )
             .with_context(|| format!("flashing {}", image.name))?;
 

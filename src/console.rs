@@ -29,6 +29,18 @@ pub fn open_rx_log(path: &Path) -> Result<File> {
         .with_context(|| format!("opening UART RX log {}", path.display()))
 }
 
+/// Throughput and compatibility settings for S-record transfers.
+#[derive(Debug, Clone, Copy)]
+pub struct SrecTransferOptions {
+    /// Flush after this many bytes of complete records have been queued.
+    pub batch_size_bytes: usize,
+    /// Optional delay after each transmitted batch.
+    pub batch_delay: Duration,
+    /// Maximum accepted line length, including newline. This is a host-side guard;
+    /// the target FlashWriter may impose a smaller limit.
+    pub max_line_bytes: usize,
+}
+
 pub struct Console {
     port: Box<dyn SerialPort>,
     pending: Vec<u8>,
@@ -87,34 +99,35 @@ impl Console {
     /// Must run during large S-record uploads: otherwise the kernel tty
     /// buffer can overrun and the FlashWriter `>` prompt is lost.
     fn drain_rx(&mut self) -> Result<()> {
-        let available = self.port.bytes_to_read().unwrap_or(0);
-        if available == 0 {
-            return Ok(());
-        }
+        loop {
+            let available = self.port.bytes_to_read().unwrap_or(0);
+            if available == 0 {
+                return Ok(());
+            }
 
-        let mut buf = vec![0_u8; available.min(4096) as usize];
-        match self.port.read(&mut buf) {
-            Ok(0) => Ok(()),
-            Ok(count) => {
-                self.log_rx(&buf[..count])?;
-                self.pending.extend_from_slice(&buf[..count]);
-                if self.pending.len() > 16_384 {
-                    let discard = self.pending.len() - 4096;
-                    self.pending.drain(..discard);
+            let mut buf = vec![0_u8; available.min(4096) as usize];
+            match self.port.read(&mut buf) {
+                Ok(0) => return Ok(()),
+                Ok(count) => {
+                    self.log_rx(&buf[..count])?;
+                    self.pending.extend_from_slice(&buf[..count]);
+                    if self.pending.len() > 16_384 {
+                        let discard = self.pending.len() - 4096;
+                        self.pending.drain(..discard);
+                    }
                 }
-                Ok(())
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -144,6 +157,20 @@ impl Console {
         self.port
             .flush()
             .map_err(|error| anyhow!("UART flush failed: {error}"))?;
+        Ok(())
+    }
+
+    /// Write a batch of complete S-record lines and flush once for the batch.
+    pub fn write_batch(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.port
+            .write_all(bytes)
+            .map_err(|error| anyhow!("UART batch write failed: {error}"))?;
+        self.port
+            .flush()
+            .map_err(|error| anyhow!("UART batch flush failed: {error}"))?;
         Ok(())
     }
 
@@ -266,29 +293,46 @@ impl Console {
         Ok(())
     }
 
-    /// Send one S-record line at a time with the legacy 10 ms pacing.
+    /// Stream S-records in batches while preserving record boundaries.
     ///
-    /// Prints an in-place progress line (percent, bytes, records) while sending.
-    /// Device RX is still drained (for prompt integrity) but not written to the
-    /// RX log during the bulk upload.
-    pub fn send_srec(&mut self, path: &Path, label: &str) -> Result<()> {
-        let file =
-            File::open(path).with_context(|| format!("opening S-record {}", path.display()))?;
+    /// Complete records are accumulated until `batch_size_bytes` is reached,
+    /// then written and flushed once. RX is drained after each batch so device
+    /// output is consumed without incurring a read/drain operation per record.
+    /// The target's S-record parser must accept each individual record length;
+    /// batching does not combine or alter S-record records.
+    pub fn send_srec(
+        &mut self,
+        path: &Path,
+        label: &str,
+        options: SrecTransferOptions,
+    ) -> Result<()> {
+        if options.batch_size_bytes == 0 {
+            bail!("S-record batch size must be greater than zero");
+        }
+        if options.max_line_bytes < 16 {
+            bail!("maximum S-record line length must be at least 16 bytes");
+        }
+
+        let file = File::open(path)
+            .with_context(|| format!("opening S-record {}", path.display()))?;
         let total_bytes = file.metadata()?.len().max(1);
         let mut reader = BufReader::new(file);
-        let mut line = Vec::with_capacity(1024);
+        let mut line = Vec::with_capacity(options.max_line_bytes.min(16 * 1024));
+        let mut batch = Vec::with_capacity(options.batch_size_bytes);
         let mut sent_bytes: u64 = 0;
         let mut records: u64 = 0;
+        let mut batch_records: u64 = 0;
         let mut last_percent: u8 = 255;
         let started = Instant::now();
         let logging = self.rx_log_enabled;
         self.rx_log_enabled = false;
 
-        let result = (|| {
+        let result = (|| -> Result<()> {
             loop {
                 line.clear();
                 let count = {
-                    let mut bounded = (&mut reader).take(1025);
+                    let limit = options.max_line_bytes.saturating_add(1) as u64;
+                    let mut bounded = (&mut reader).take(limit);
                     bounded.read_until(b'\n', &mut line)?
                 };
 
@@ -296,41 +340,80 @@ impl Console {
                     break;
                 }
 
-                sent_bytes = sent_bytes.saturating_add(count as u64);
-
-                if line.len() > 1024 {
-                    eprint!("\n");
-                    bail!("S-record line exceeds 1024 bytes in {}", path.display());
+                if line.len() > options.max_line_bytes {
+                    bail!(
+                        "S-record line exceeds configured limit of {} bytes in {} (use --max-srec-line-bytes only if the target supports longer records)",
+                        options.max_line_bytes,
+                        path.display()
+                    );
                 }
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
                 if !line.starts_with(b"S") {
-                    eprint!("\n");
                     bail!("invalid S-record line in {}", path.display());
                 }
 
-                self.send(&line)?;
-                self.drain_rx()?;
-                records += 1;
-                std::thread::sleep(Duration::from_millis(10));
+                // Never split or merge records: append a complete source line.
+                // A single record larger than the batch target is sent alone.
+                if !batch.is_empty()
+                    && batch.len().saturating_add(line.len()) > options.batch_size_bytes
+                {
+                    self.write_batch(&batch)?;
+                    self.drain_rx()?;
+                    sent_bytes = sent_bytes.saturating_add(batch.len() as u64);
+                    records = records.saturating_add(batch_records);
+                    batch.clear();
+                    batch_records = 0;
+                    if !options.batch_delay.is_zero() {
+                        std::thread::sleep(options.batch_delay);
+                    }
+                    let percent = ((sent_bytes.saturating_mul(100)) / total_bytes).min(100) as u8;
+                    if percent != last_percent || records % 25 == 0 {
+                        last_percent = percent;
+                        render_progress(label, percent, sent_bytes, total_bytes, records, started);
+                    }
+                }
 
-                let percent = ((sent_bytes.saturating_mul(100)) / total_bytes).min(100) as u8;
-                if percent != last_percent || records == 1 || records % 25 == 0 {
-                    last_percent = percent;
-                    render_progress(label, percent, sent_bytes, total_bytes, records, started);
+                batch.extend_from_slice(&line);
+                batch_records = batch_records.saturating_add(1);
+
+                if batch.len() >= options.batch_size_bytes {
+                    self.write_batch(&batch)?;
+                    self.drain_rx()?;
+                    sent_bytes = sent_bytes.saturating_add(batch.len() as u64);
+                    records = records.saturating_add(batch_records);
+                    batch.clear();
+                    batch_records = 0;
+                    if !options.batch_delay.is_zero() {
+                        std::thread::sleep(options.batch_delay);
+                    }
+                    let percent = ((sent_bytes.saturating_mul(100)) / total_bytes).min(100) as u8;
+                    if percent != last_percent || records == 1 || records % 25 == 0 {
+                        last_percent = percent;
+                        render_progress(label, percent, sent_bytes, total_bytes, records, started);
+                    }
                 }
             }
 
-            self.drain_rx()?;
-            render_progress(label, 100, total_bytes, total_bytes, records, started);
+            if !batch.is_empty() {
+                self.write_batch(&batch)?;
+                self.drain_rx()?;
+                sent_bytes = sent_bytes.saturating_add(batch.len() as u64);
+                records = records.saturating_add(batch_records);
+                if !options.batch_delay.is_zero() {
+                    std::thread::sleep(options.batch_delay);
+                }
+            }
+
+            render_progress(label, 100, sent_bytes, total_bytes, records, started);
             eprintln!();
             Ok(())
         })();
 
         self.rx_log_enabled = logging;
-        // Bytes drained during the upload sit in `pending` but were not logged;
-        // flush them now so post-flash device text (e.g. DRAM errors) is captured.
+        // Bytes drained during upload sit in `pending` but were intentionally not
+        // logged during bulk transfer; write them to the log after restoring it.
         if result.is_ok() && logging && !self.pending.is_empty() {
             let pending = self.pending.clone();
             let _ = self.log_rx(&pending);

@@ -45,8 +45,8 @@ pub fn load_package_config(package: &Path) -> Result<IplPackageConfig> {
     let path = package.join(IPL_CONFIG_FILE);
     let text = fs::read_to_string(&path)
         .with_context(|| format!("reading {} under {}", IPL_CONFIG_FILE, package.display()))?;
-    let config: IplPackageConfig =
-        serde_json::from_str(&text).with_context(|| format!("invalid {IPL_CONFIG_FILE}"))?;
+    let config: IplPackageConfig = serde_json::from_str(&text)
+        .with_context(|| format!("invalid {IPL_CONFIG_FILE}"))?;
 
     if config.flash_writer.trim().is_empty() {
         bail!("{IPL_CONFIG_FILE}: flashWriter must be non-empty");
@@ -86,8 +86,8 @@ pub fn preflight(package: &Path) -> Result<IplPackageConfig> {
 }
 
 pub fn package_dir(path: &Path) -> Result<PathBuf> {
-    let package =
-        fs::canonicalize(path).with_context(|| format!("images folder {}", path.display()))?;
+    let package = fs::canonicalize(path)
+        .with_context(|| format!("images folder {}", path.display()))?;
     if !package.is_dir() {
         bail!("{} is not a directory", package.display());
     }
