@@ -1,0 +1,53 @@
+{
+  "flashWriter": "ICUMX_Flash_writer_SCIF_DUMMY_CERT_EB203000_V4H.mot",
+  "images": [
+    {
+      "name": "bootparam_sa0.srec",
+      "save": "0",
+      "address": "EB200000",
+      "emmc": false
+    },
+    {
+      "name": "icumx_loader.srec",
+      "save": "40000",
+      "address": "EB210000",
+      "emmc": false
+    },
+    {
+      "name": "cert_header_sa9.srec",
+      "save": "240000",
+      "address": "EB230000",
+      "emmc": false
+    },
+    {
+      "name": "dummy_fw.srec",
+      "save": "280000",
+      "address": "EB240000",
+      "emmc": false
+    },
+    {
+      "name": "cr52_loader.srec",
+      "save": "480000",
+      "address": "E6300000",
+      "emmc": false
+    },
+    {
+      "name": "dummy_rtos.srec",
+      "save": "2800",
+      "address": "E2100000",
+      "emmc": true
+    },
+    {
+      "name": "bl31-whitehawk.srec",
+      "save": "a000",
+      "address": "46400000",
+      "emmc": true
+    },
+    {
+      "name": "u-boot-elf-whitehawk.srec",
+      "save": "ac00",
+      "address": "50000000",
+      "emmc": true
+    }
+  ]
+}

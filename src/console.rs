@@ -272,8 +272,8 @@ impl Console {
     /// Device RX is still drained (for prompt integrity) but not written to the
     /// RX log during the bulk upload.
     pub fn send_srec(&mut self, path: &Path, label: &str) -> Result<()> {
-        let file = File::open(path)
-            .with_context(|| format!("opening S-record {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("opening S-record {}", path.display()))?;
         let total_bytes = file.metadata()?.len().max(1);
         let mut reader = BufReader::new(file);
         let mut line = Vec::with_capacity(1024);

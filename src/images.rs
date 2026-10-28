@@ -1,70 +1,29 @@
-//! Gen4 FlashWriter image list (from edgecontroller).
+//! Gen4 FlashWriter package layout from `ipl.json`.
 
 use anyhow::{bail, Context, Result};
-use std::{fs, path::{Path, PathBuf}};
+use serde::Deserialize;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-pub const FLASHWRITER: &str = "ICUMX_Flash_writer_SCIF_DUMMY_CERT_EB203000_V4H.mot";
+pub const IPL_CONFIG_FILE: &str = "ipl.json";
 pub const MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Image {
-    pub name: &'static str,
-    pub save: &'static str,
-    pub address: &'static str,
+    pub name: String,
+    pub save: String,
+    pub address: String,
     pub emmc: bool,
 }
 
-/// Programming order used by edgecontroller Gen3/Gen4 FlashWriter.
-pub const IMAGES: [Image; 8] = [
-    Image {
-        name: "bootparam_sa0.srec",
-        save: "0",
-        address: "EB200000",
-        emmc: false,
-    },
-    Image {
-        name: "icumx_loader.srec",
-        save: "40000",
-        address: "EB210000",
-        emmc: false,
-    },
-    Image {
-        name: "cert_header_sa9.srec",
-        save: "240000",
-        address: "EB230000",
-        emmc: false,
-    },
-    Image {
-        name: "dummy_fw.srec",
-        save: "280000",
-        address: "EB240000",
-        emmc: false,
-    },
-    Image {
-        name: "cr52_loader.srec",
-        save: "480000",
-        address: "E6300000",
-        emmc: false,
-    },
-    Image {
-        name: "dummy_rtos.srec",
-        save: "2800",
-        address: "E2100000",
-        emmc: true,
-    },
-    Image {
-        name: "bl31-whitehawk.srec",
-        save: "a000",
-        address: "46400000",
-        emmc: true,
-    },
-    Image {
-        name: "u-boot-elf-whitehawk.srec",
-        save: "ac00",
-        address: "50000000",
-        emmc: true,
-    },
-];
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IplPackageConfig {
+    pub flash_writer: String,
+    pub images: Vec<Image>,
+}
 
 pub fn image_file(package: &Path, name: &str) -> Result<PathBuf> {
     let path = fs::canonicalize(package.join(name))
@@ -82,24 +41,53 @@ pub fn image_file(package: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn preflight(package: &Path) -> Result<()> {
-    let package = fs::canonicalize(package)
-        .with_context(|| format!("images folder {}", package.display()))?;
-    if !package.is_dir() {
-        bail!("{} is not a directory", package.display());
+pub fn load_package_config(package: &Path) -> Result<IplPackageConfig> {
+    let path = package.join(IPL_CONFIG_FILE);
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("reading {} under {}", IPL_CONFIG_FILE, package.display()))?;
+    let config: IplPackageConfig =
+        serde_json::from_str(&text).with_context(|| format!("invalid {IPL_CONFIG_FILE}"))?;
+
+    if config.flash_writer.trim().is_empty() {
+        bail!("{IPL_CONFIG_FILE}: flashWriter must be non-empty");
+    }
+    if config.flash_writer.contains('/') || config.flash_writer.contains('\\') {
+        bail!("{IPL_CONFIG_FILE}: flashWriter must be a bare file name");
+    }
+    if config.images.is_empty() {
+        bail!("{IPL_CONFIG_FILE}: images must not be empty");
+    }
+    for image in &config.images {
+        if image.name.trim().is_empty()
+            || image.save.trim().is_empty()
+            || image.address.trim().is_empty()
+        {
+            bail!("{IPL_CONFIG_FILE}: each image needs name, save, and address");
+        }
+        if image.name.contains('/') || image.name.contains('\\') {
+            bail!(
+                "{IPL_CONFIG_FILE}: image name must be a bare file name: {}",
+                image.name
+            );
+        }
     }
 
-    image_file(&package, FLASHWRITER)?;
-    for image in &IMAGES {
-        image_file(&package, image.name)?;
-    }
+    Ok(config)
+}
 
-    Ok(())
+pub fn preflight(package: &Path) -> Result<IplPackageConfig> {
+    let package = package_dir(package)?;
+    let config = load_package_config(&package)?;
+    image_file(&package, &config.flash_writer)?;
+    for image in &config.images {
+        image_file(&package, &image.name)?;
+    }
+    Ok(config)
 }
 
 pub fn package_dir(path: &Path) -> Result<PathBuf> {
-    let package = fs::canonicalize(path)
-        .with_context(|| format!("images folder {}", path.display()))?;
+    let package =
+        fs::canonicalize(path).with_context(|| format!("images folder {}", path.display()))?;
     if !package.is_dir() {
         bail!("{} is not a directory", package.display());
     }

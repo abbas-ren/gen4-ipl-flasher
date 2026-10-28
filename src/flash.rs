@@ -2,13 +2,10 @@
 
 use crate::{
     console::{open_rx_log, Console},
-    images::{image_file, Image, FLASHWRITER},
+    images::{image_file, Image},
 };
 use anyhow::{Context, Result};
-use std::{
-    path::Path,
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
 
 fn seconds(value: u64) -> Duration {
     Duration::from_secs(value)
@@ -38,10 +35,10 @@ pub fn wait_for_download_prompt(console: &mut Console, timeout_secs: u64) -> Res
 }
 
 /// Load FlashWriter into RAM over SCIF, then wait for its `>` prompt.
-pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
-    let flashwriter = image_file(package, FLASHWRITER)?;
+pub fn load_flashwriter(console: &mut Console, package: &Path, flash_writer: &str) -> Result<()> {
+    let flashwriter = image_file(package, flash_writer)?;
     console.log_marker("FlashWriter .mot send starting (RX log paused during upload)")?;
-    println!("Sending FlashWriter ({FLASHWRITER})…");
+    println!("Sending FlashWriter ({flash_writer})…");
     console.send_srec(&flashwriter, "FlashWriter")?;
 
     console.log_marker("FlashWriter .mot send finished — logging device RX again")?;
@@ -98,7 +95,7 @@ pub fn load_flashwriter(console: &mut Console, package: &Path) -> Result<()> {
 
 /// Program one image through an already-running FlashWriter session.
 pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> Result<()> {
-    let file = image_file(package, image.name)?;
+    let file = image_file(package, &image.name)?;
     console.log_marker(&format!("Programming payload {}", image.name))?;
     println!(
         "Programming {} (save={}, address={}, emmc={})",
@@ -143,7 +140,7 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
         "Payload {} S-record send starting (RX log paused during upload)",
         image.name
     ))?;
-    console.send_srec(&file, image.name)?;
+    console.send_srec(&file, &image.name)?;
     console.log_marker(&format!(
         "Payload {} S-record send finished — logging post-flash device RX",
         image.name
@@ -153,6 +150,9 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
         console
             .wait(b"EM_W Complete!", seconds(60))
             .with_context(|| format!("waiting for eMMC complete for {}", image.name))?;
+        console
+            .wait(b">", seconds(10))
+            .with_context(|| format!("waiting for FlashWriter prompt after {}", image.name))?;
     } else {
         let response = console
             .wait_any(&[b"complete!", b"Clear OK?(y/n)"], seconds(60), false)
@@ -160,8 +160,12 @@ pub fn transfer_image(console: &mut Console, package: &Path, image: &Image) -> R
 
         if response == 1 {
             console.send(b"y")?;
-            console.wait(b">", seconds(10))?;
         }
+        // Always synchronize on the command prompt before another image is
+        // attempted. In the Clear OK path, the confirmation is sent above.
+        console
+            .wait(b">", seconds(10))
+            .with_context(|| format!("waiting for FlashWriter prompt after {}", image.name))?;
     }
 
     // Capture any trailing board output after the file finishes.
@@ -176,6 +180,7 @@ pub fn flash_one_image(
     tty: &str,
     baud: u32,
     package: &Path,
+    flash_writer: &str,
     image: &Image,
     download_timeout_secs: u64,
     uart_log: &Path,
@@ -195,11 +200,66 @@ pub fn flash_one_image(
     console.set_rx_logging(true);
 
     wait_for_download_prompt(&mut console, download_timeout_secs)?;
-    load_flashwriter(&mut console, package)?;
+    load_flashwriter(&mut console, package, flash_writer)?;
     transfer_image(&mut console, package, image)?;
 
     console.log_marker(&format!("Session finished for {}", image.name))?;
     drop(console);
     println!("Serial port closed. Safe to reboot for the next file when asked.");
+    Ok(())
+}
+
+pub fn flash_all_images(
+    tty: &str,
+    baud: u32,
+    package: &Path,
+    flash_writer: &str,
+    images: &[Image],
+    download_timeout_secs: u64,
+    uart_log: &Path,
+) -> Result<()> {
+    if images.is_empty() {
+        anyhow::bail!("no images selected to flash");
+    }
+
+    println!("Opening {tty} at {baud} baud (listen BEFORE download-mode reset)…");
+    println!("Device RX log: {}", uart_log.display());
+
+    let mut console = Console::open(tty, baud)?;
+    console.attach_rx_log(open_rx_log(uart_log)?);
+    console.clear_input()?;
+    console.set_rx_logging(true);
+
+    console.log_marker("Starting all-in-one-go flashing session")?;
+    wait_for_download_prompt(&mut console, download_timeout_secs)?;
+
+    // FlashWriter is loaded once for this session. The device must return to
+    // the FlashWriter command prompt after each payload so the next command
+    // can be issued without another SCIF reset.
+    load_flashwriter(&mut console, package, flash_writer)?;
+
+    let total = images.len();
+    for (index, image) in images.iter().enumerate() {
+        let step = index + 1;
+        println!("========== [{step}/{total}] {} ==========", image.name);
+        console.log_marker(&format!("Starting image [{step}/{total}]: {}", image.name))?;
+
+        transfer_image(&mut console, package, image)
+            .with_context(|| format!("flashing image [{step}/{total}] {}", image.name))?;
+
+        console.log_marker(&format!("Completed image [{step}/{total}]: {}", image.name))?;
+        println!("OK: {} ({step}/{total})", image.name);
+
+        if step < total {
+            // Capture trailing output and allow the command loop to settle before
+            // issuing the next FlashWriter command.
+            console.collect_rx_for(Duration::from_secs(1))?;
+            println!("Next image: {}", images[step].name);
+        }
+    }
+
+    console.log_marker("All selected images completed in one session")?;
+    drop(console);
+    println!("Serial port closed.");
     Ok(())
 }

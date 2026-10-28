@@ -1,0 +1,185 @@
+;---------------------------------------------------
+; Setting load image parameter
+;---------------------------------------------------
+ARRAY_NUM = 9
+strdim IMGNM ARRAY_NUM
+IMGNM[0] = 'bootparam_sa0.srec'
+IMGNM[1] = 'icumx_loader_tee.srec'
+IMGNM[2] = 'cert_header_sa9.srec'
+IMGNM[3] = 'dummy_fw.srec'
+IMGNM[4] = 'cr52_loader_ecc_on_tee.srec'
+IMGNM[5] = 'dummy_rtos.srec'
+IMGNM[6] = 'bl31-grayhawk.srec'
+IMGNM[7] = 'u-boot-elf-grayhawk.srec'
+IMGNM[8] = 'tee-grayhawk.srec'
+
+strdim SAVEADR ARRAY_NUM
+SAVEADR[0] = '0'
+SAVEADR[1] = '40000'
+SAVEADR[2] = '240000'
+SAVEADR[3] = '280000'
+SAVEADR[4] = '480000'
+SAVEADR[5] = '0000'
+SAVEADR[6] = 'a000'
+SAVEADR[7] = 'ac00'
+SAVEADR[8] = 'a400'
+
+strdim IMGADR ARRAY_NUM
+IMGADR[0] = 'EB200000'
+IMGADR[1] = 'EB210000'
+IMGADR[2] = 'EB230000'
+IMGADR[3] = 'EB240000'
+IMGADR[4] = 'E6300000'
+IMGADR[5] = 'E2100000'
+IMGADR[6] = '46400000'
+IMGADR[7] = '50000000'
+IMGADR[8] = '44100000'
+
+strdim WRITESEL ARRAY_NUM
+WRITESEL[0] = 'Flash'
+WRITESEL[1] = 'Flash'
+WRITESEL[2] = 'Flash'
+WRITESEL[3] = 'Flash'
+WRITESEL[4] = 'Flash'
+WRITESEL[5] = 'eMMC'
+WRITESEL[6] = 'eMMC'
+WRITESEL[7] = 'eMMC'
+WRITESEL[8] = 'eMMC'
+
+;---------------------------------------------------
+; Setting FlashWriter parameter
+;---------------------------------------------------
+FLASHWRITER_FILE = 'ICUMX_Flash_writer_SCIF_DUMMY_CERT_EB203000_V4M.mot'
+FLASHWRITER_SPEED = 921600
+
+;---------------------------------------------------
+; Select load all images
+;---------------------------------------------------
+LOAD_FILES = 'all'
+
+;---------------------------------------------------
+; DO NOT EDIT THE FOLLOWING LINES
+;---------------------------------------------------
+; Main program
+;---------------------------------------------------
+getdir DIR
+
+call Load_FlashWriter
+call Load_all_image
+
+end
+
+;---------------------------------------------------
+; load FlashWriter
+;---------------------------------------------------
+:Load_FlashWriter
+filesearch FLASHWRITER_FILE
+if result=0 then
+    sprintf 'File "%s" not found' FLASHWRITER_FILE
+    messagebox inputstr 'error'
+    break
+endif
+
+setbaud 921600
+sprintf2 FILE_NAME '%s\%s' DIR FLASHWRITER_FILE
+sendfile FILE_NAME 1
+wait '>'
+
+return
+
+;---------------------------------------------------
+; load all images
+;---------------------------------------------------
+:Load_All_image
+
+; file check
+for i 0 ARRAY_NUM-1
+    filesearch IMGNM[i]
+    if result=0 then
+        sprintf 'File "%s" not found' IMGNM[i]
+        messagebox inputstr 'error'
+        break
+    endif
+next
+
+if result=1 then
+    for i 0 ARRAY_NUM-1
+        index = i
+        strcompare WRITESEL[i] 'Flash'
+        if result=0 then
+            call Load_Image
+        endif
+        strcompare WRITESEL[i] 'eMMC'
+        if result=0 then
+            call Load_Image_eMMC
+        endif
+    next
+else
+    messagebox "Cancel write all images" "error"
+endif
+
+;messagebox "Write Complete" ""
+return
+
+;---------------------------------------------------
+; Load Image To Flash
+;---------------------------------------------------
+:Load_Image
+mpause 10
+sendln 'xls2'
+wait '  Select (1-3)>'
+mpause 10
+sendln '1'
+wait '(Push Y key)'
+mpause 10
+send 'y'
+wait '(Push Y key)'
+mpause 10
+send 'y'
+wait '  Please Input : H'
+mpause 1
+sendln IMGADR[index]
+wait '  Please Input : H'
+sendln SAVEADR[index]
+mpause 400
+wait 'please send ! (Motorola S-record)'
+mpause 400
+sprintf2 FILE_NAME '%s\%s' DIR IMGNM[index]
+sendfile FILE_NAME 1
+wait 'complete!' 'Clear OK?(y/n)'
+If result=1 goto proc_end
+If result=2 goto send_y
+
+:send_y
+send 'y'
+wait '>'
+
+:proc_end
+mpause 100
+return
+
+;---------------------------------------------------
+; Load Image To eMMC
+;---------------------------------------------------
+:Load_Image_eMMC
+mpause 10
+sendln 'em_w'
+wait '(Push Y key)'
+mpause 10
+send 'y'
+wait '  Select area(0-2)>'
+mpause 10
+sendln '1'
+wait 'Please Input Start Address in sector :'
+mpause 1
+sendln SAVEADR[index]
+wait 'Please Input Program Start Address :'
+sendln IMGADR[index]
+mpause 400
+wait 'please send ! (Motorola S-record)'
+mpause 400
+sprintf2 FILE_NAME '%s\%s' DIR IMGNM[index]
+sendfile FILE_NAME 1
+wait 'EM_W Complete!'
+mpause 100
+return
